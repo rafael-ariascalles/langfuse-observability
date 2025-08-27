@@ -51,7 +51,7 @@ async def register_traces(request: TraceRegistrationRequest):
         job_id = str(uuid.uuid4())
         
         # Queue the processing task
-        task = celery_app.send_task('process_traces', args=[request.model_dump()])
+        task = celery_app.send_task('process_traces', args=[request.model_dump()], queue='traces')
         
         # Store job metadata in Redis
         job_metadata = {
@@ -182,7 +182,7 @@ async def health_check():
     
     # Check Celery worker health
     try:
-        worker_check = celery_app.send_task('health_check')
+        worker_check = celery_app.send_task('health_check', queue='traces')
         worker_result = worker_check.get(timeout=5)
         worker_status = "healthy" if worker_result.get("status") == "healthy" else "unhealthy"
     except Exception:
