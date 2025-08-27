@@ -1,0 +1,40 @@
+services:
+  langfuse-trace-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Langfuse Configuration - REQUIRED
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_API_URL=${LANGFUSE_API_URL:-https://us.cloud.langfuse.com}
+      - LANGFUSE_PROJECT_NAME=${LANGFUSE_PROJECT_NAME:-Amazon Bedrock Agents}
+      - LANGFUSE_ENVIRONMENT=${LANGFUSE_ENVIRONMENT:-development}
+      
+      # Service Configuration - OPTIONAL
+      - LANGFUSE_HOST=0.0.0.0
+      - LANGFUSE_PORT=8000
+      - LANGFUSE_LOG_LEVEL=${LANGFUSE_LOG_LEVEL:-INFO}
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    restart: unless-stopped
+    
+    # Optional: Mount logs directory
+    volumes:
+      - ./logs:/app/logs
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
