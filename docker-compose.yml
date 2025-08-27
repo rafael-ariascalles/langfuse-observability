@@ -1,6 +1,22 @@
 services:
-  langfuse-trace-service:
-    build: .
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  langfuse-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
     ports:
       - "8000:8000"
     environment:
@@ -15,26 +31,92 @@ services:
       - LANGFUSE_HOST=0.0.0.0
       - LANGFUSE_PORT=8000
       - LANGFUSE_LOG_LEVEL=${LANGFUSE_LOG_LEVEL:-INFO}
+      
+      # Redis Configuration
+      - LANGFUSE_REDIS_URL=redis://redis:6379/0
+      - LANGFUSE_CELERY_BROKER_URL=redis://redis:6379/0
+      - LANGFUSE_CELERY_RESULT_BACKEND=redis://redis:6379/0
+    
+    depends_on:
+      redis:
+        condition: service_healthy
     
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
     
     restart: unless-stopped
-    
-    # Optional: Mount logs directory
-    volumes:
-      - ./logs:/app/logs
     
     # Resource limits
     deploy:
       resources:
         limits:
           cpus: '0.5'
-          memory: 512M
+          memory: 256M
         reservations:
           cpus: '0.1'
+          memory: 64M
+
+  langfuse-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      # Langfuse Configuration - REQUIRED
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}
+      - LANGFUSE_API_URL=${LANGFUSE_API_URL:-https://us.cloud.langfuse.com}
+      - LANGFUSE_PROJECT_NAME=${LANGFUSE_PROJECT_NAME:-Amazon Bedrock Agents}
+      - LANGFUSE_ENVIRONMENT=${LANGFUSE_ENVIRONMENT:-development}
+      
+      # Service Configuration - OPTIONAL
+      - LANGFUSE_HOST=0.0.0.0
+      - LANGFUSE_PORT=8000
+      - LANGFUSE_LOG_LEVEL=${LANGFUSE_LOG_LEVEL:-INFO}
+      
+      # Redis Configuration
+      - LANGFUSE_REDIS_URL=redis://redis:6379/0
+      - LANGFUSE_CELERY_BROKER_URL=redis://redis:6379/0
+      - LANGFUSE_CELERY_RESULT_BACKEND=redis://redis:6379/0
+    
+    depends_on:
+      redis:
+        condition: service_healthy
+    
+    restart: unless-stopped
+    
+    # Scale workers as needed
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.2'
           memory: 128M
+    
+    # Optional: Mount logs directory
+    volumes:
+      - ./logs:/app/logs
+
+  # Optional: Celery Flower for monitoring workers
+  flower:
+    image: mher/flower:2.0
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - FLOWER_PORT=5555
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - monitoring
+
+volumes:
+  redis_data:
