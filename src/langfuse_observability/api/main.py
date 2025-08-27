@@ -20,7 +20,7 @@ from loguru import logger
 
 from langfuse_observability.shared.models import TraceRegistrationRequest, JobResponse, JobStatus
 from langfuse_observability.shared.settings import settings
-from langfuse_observability.worker.tasks import process_traces
+from langfuse_observability.worker.celery_app import celery_app
 
 # Configure loguru logging
 logger.remove()
@@ -51,7 +51,7 @@ async def register_traces(request: TraceRegistrationRequest):
         job_id = str(uuid.uuid4())
         
         # Queue the processing task
-        task = process_traces.delay(request.model_dump())
+        task = celery_app.send_task('process_traces', args=[request.model_dump()])
         
         # Store job metadata in Redis
         job_metadata = {
@@ -65,10 +65,11 @@ async def register_traces(request: TraceRegistrationRequest):
         }
         
         # Store with expiration (24 hours)
+        import json
         redis_client.setex(
             f"job:{task.id}", 
             86400,  # 24 hours
-            redis_client.json().set(".", job_metadata)
+            json.dumps(job_metadata)
         )
         
         logger.info(f"✅ Queued trace processing job {task.id}")
@@ -181,8 +182,7 @@ async def health_check():
     
     # Check Celery worker health
     try:
-        from langfuse_observability.worker.tasks import health_check
-        worker_check = health_check.delay()
+        worker_check = celery_app.send_task('health_check')
         worker_result = worker_check.get(timeout=5)
         worker_status = "healthy" if worker_result.get("status") == "healthy" else "unhealthy"
     except Exception:
