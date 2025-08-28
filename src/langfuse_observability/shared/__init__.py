@@ -1,1 +1,1 @@
-"""Shared components for Langfuse Observability Service."""
+# Shared components
