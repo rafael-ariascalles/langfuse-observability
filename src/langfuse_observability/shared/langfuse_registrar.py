@@ -109,10 +109,14 @@ class LangfuseTraceRegistrar:
             end_time = time.time()
             processing_duration = (end_time - start_time) * 1000
             
-            root_trace.update(
-                end_time=datetime.now(timezone.utc),
+            # Create a summary span to capture the processing results
+            root_trace.start_span(
+                name="trace_processing_summary",
+                input=f"Processed {len(request.traces)} Bedrock Agent traces",
+                output=f"Created {len(processed_objects)} structured Langfuse objects",
                 metadata={
-                    **root_trace.metadata,
+                    "type": "event",
+                    "level": "INFO",
                     "processing_duration_ms": processing_duration,
                     "processed_objects": {
                         "generations": total_generations,
@@ -122,11 +126,13 @@ class LangfuseTraceRegistrar:
                         "guardrails": total_guardrails,
                         "events": total_events,
                         "total": len(processed_objects)
-                    }
+                    },
+                    "langfuse_object_type": "event"
                 }
-            )
+            ).end()
             
-            # Flush to ensure data is sent to Langfuse
+            # End the root trace and flush to ensure data is sent to Langfuse
+            root_trace.end()
             self.langfuse.flush()
             
             logger.info(f"✅ Successfully registered {len(processed_objects)} Langfuse objects "
@@ -166,7 +172,7 @@ class LangfuseTraceRegistrar:
             "trace_created_at": datetime.now(timezone.utc).isoformat()
         })
         
-        # Create root trace using correct Langfuse SDK syntax (use start_span for root)
+        # Create root trace using correct Langfuse SDK syntax
         root_trace = self.langfuse.start_span(
             name=f"bedrock_agent_{request.agent_id}",
             input=request.input_text,
@@ -232,7 +238,19 @@ class LangfuseTraceRegistrar:
             }
         
         # Create generation using correct Langfuse SDK syntax
-        generation = self.langfuse.start_generation(**generation_params, parent=parent_trace)
+        generation = self.langfuse.start_generation(
+            name=generation_params["name"],
+            input=generation_params["input"],
+            output=generation_params["output"],
+            model=generation_params["model"],
+            metadata=generation_params["metadata"]
+        )
+        
+        # Add usage if available
+        if "usage" in generation_params:
+            generation.update(
+                usage_details=generation_params["usage"]
+            )
         
         logger.debug(f"Created generation: {name}")
         return generation
@@ -241,7 +259,7 @@ class LangfuseTraceRegistrar:
         """Create Langfuse tool object for external calls."""
         
         # Tools are spans with tool-specific metadata
-        tool = self.langfuse.start_span(
+        tool = parent_trace.start_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -249,8 +267,7 @@ class LangfuseTraceRegistrar:
                 **obj_data.get("metadata", {}),
                 "type": "tool",  # Langfuse categorization
                 "langfuse_object_type": "tool"
-            },
-            parent=parent_trace
+            }
         )
         
         logger.debug(f"Created tool span: {name}")
@@ -260,7 +277,7 @@ class LangfuseTraceRegistrar:
         """Create Langfuse retriever object for data retrieval."""
         
         # Retrievers are spans with retriever-specific metadata
-        retriever = self.langfuse.start_span(
+        retriever = parent_trace.start_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -268,8 +285,7 @@ class LangfuseTraceRegistrar:
                 **obj_data.get("metadata", {}),
                 "type": "retriever",  # Langfuse categorization
                 "langfuse_object_type": "retriever"
-            },
-            parent=parent_trace
+            }
         )
         
         logger.debug(f"Created retriever span: {name}")
@@ -278,12 +294,11 @@ class LangfuseTraceRegistrar:
     def _create_span(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse span object for durations."""
         
-        span = self.langfuse.start_span(
+        span = parent_trace.start_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
-            metadata=obj_data.get("metadata", {}),
-            parent=parent_trace
+            metadata=obj_data.get("metadata", {})
         )
         
         logger.debug(f"Created span: {name}")
@@ -293,7 +308,7 @@ class LangfuseTraceRegistrar:
         """Create Langfuse guardrail object for content protection."""
         
         # Guardrails are spans with guardrail-specific metadata
-        guardrail = self.langfuse.start_span(
+        guardrail = parent_trace.start_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -301,8 +316,7 @@ class LangfuseTraceRegistrar:
                 **obj_data.get("metadata", {}),
                 "type": "guardrail",  # Langfuse categorization
                 "langfuse_object_type": "guardrail"
-            },
-            parent=parent_trace
+            }
         )
         
         logger.debug(f"Created guardrail span: {name}")
@@ -311,13 +325,17 @@ class LangfuseTraceRegistrar:
     def _create_event(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse event object for discrete events."""
         
-        event = self.langfuse.create_event(
+        # Events are created as child spans with event-specific metadata
+        event = parent_trace.start_span(
             name=name,
             input=obj_data.get("input", ""),
             output=obj_data.get("output", ""),
-            level=obj_data.get("level", "DEFAULT"),
-            metadata=obj_data.get("metadata", {}),
-            parent=parent_trace
+            metadata={
+                **obj_data.get("metadata", {}),
+                "type": "event",
+                "level": obj_data.get("level", "DEFAULT"),
+                "langfuse_object_type": "event"
+            }
         )
         
         logger.debug(f"Created event: {name}")
@@ -326,18 +344,19 @@ class LangfuseTraceRegistrar:
     def _create_fallback_event(self, parent_trace, bedrock_trace: Dict[str, Any], error_msg: str, trace_index: int):
         """Create fallback event when trace processing fails."""
         
-        fallback_event = self.langfuse.create_event(
+        fallback_event = parent_trace.start_span(
             name=f"processing_error_{trace_index}",
             input=f"Failed to process Bedrock trace: {error_msg}",
             output=str(bedrock_trace),
-            level="ERROR",
             metadata={
+                "type": "event",
+                "level": "ERROR",
                 "component": "trace_processor",
                 "error_message": error_msg,
                 "trace_index": trace_index,
-                "original_trace": bedrock_trace
-            },
-            parent=parent_trace
+                "original_trace": bedrock_trace,
+                "langfuse_object_type": "event"
+            }
         )
         
         logger.debug(f"Created fallback event for trace {trace_index}")

@@ -17,7 +17,8 @@ from loguru import logger
 
 from langfuse_observability.worker.celery_app import celery_app
 from langfuse_observability.shared.models import TraceRegistrationRequest
-from langfuse_observability.shared.trace_registrar import TraceRegistrar
+from langfuse_observability.shared.langfuse_registrar import create_langfuse_registrar
+from langfuse_observability.shared.settings import settings
 
 
 @celery_app.task(bind=True, name="process_traces")
@@ -49,8 +50,8 @@ def process_traces(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         # Parse request data into Pydantic model
         request = TraceRegistrationRequest(**request_data)
         
-        # Create trace registrar instance
-        trace_registrar = TraceRegistrar()
+        # Create structured Langfuse trace registrar instance
+        trace_registrar = create_langfuse_registrar(settings)
         
         # Process traces
         start_time = time.time()
