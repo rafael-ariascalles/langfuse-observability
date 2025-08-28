@@ -242,8 +242,9 @@ class LangfuseTraceRegistrar:
         counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
         
         # L2: Create orchestrationTrace span
-        with self.langfuse.start_as_current_span(
+        with self.langfuse.start_as_current_observation(
             name="orchestrationTrace",
+            as_type="span",
             input=orch_trace.get("modelInvocationInput", {}).get("text", ""),
             output="",  # Will be updated when we get the output
             metadata={
@@ -253,10 +254,11 @@ class LangfuseTraceRegistrar:
             }
         ) as l2_span:
             
-            # L3: Handle LLM invocation (generation)
+            # L3: Handle LLM invocation (generation) - Use new 2025 SDK pattern
             if "modelInvocationInput" in orch_trace or "modelInvocationOutput" in orch_trace:
-                with self.langfuse.start_as_current_generation(
+                with self.langfuse.start_as_current_observation(
                     name="llm",
+                    as_type="generation",
                     model=self._extract_model_id(orch_trace),
                     input=orch_trace.get("modelInvocationInput", {}).get("text", ""),
                     output="",  # Will be updated
@@ -267,25 +269,46 @@ class LangfuseTraceRegistrar:
                     }
                 ) as l3_generation:
                     
-                    # L4: Model invocation output
+                    # L4: Model invocation output - Create separate child object for OpenTelemetry parity
                     if "modelInvocationOutput" in orch_trace:
                         model_output = orch_trace["modelInvocationOutput"]
                         output_text = self._extract_output_text(model_output)
                         usage_data = self._extract_usage_data(model_output)
                         
+                        # Update L3 generation with basic output
                         l3_generation.update(
                             output=output_text,
                             usage_details=usage_data
                         )
+                        
+                        # L4: Create child span for model output details (OpenTelemetry parity)
+                        with l3_generation.start_as_current_observation(
+                            name="OrchestrationModelInvocationOutput",
+                            as_type="span",
+                            input="Model inference completed",
+                            output=output_text,
+                            metadata={
+                                "component": "model_output",
+                                "level": "L4", 
+                                "parent_component": "llm",
+                                "raw_response": model_output.get("parsedResponse", {}),
+                                "filtered": model_output.get("parsedResponse", {}).get("isGuardrailFiltered", False),
+                                "usage_details": usage_data
+                            }
+                        ):
+                            processed_objects.append("span")  # L4 span
+                            counts["spans"] += 1
+                        
                         l2_span.update(output=output_text)  # Update L2 span output too
                         
-                    processed_objects.append("generation")
+                    processed_objects.append("generation")  # L3 generation
                     counts["generations"] += 1
             
             # L3: Handle rationale
             if "rationale" in orch_trace:
-                with self.langfuse.start_as_current_span(
+                with self.langfuse.start_as_current_observation(
                     name="rationale",
+                    as_type="span",
                     input=orch_trace["rationale"].get("text", ""),
                     output="Agent reasoning completed",
                     metadata={
@@ -304,24 +327,44 @@ class LangfuseTraceRegistrar:
             if action_group_input or action_group_output:
                 action_name = f"{action_group_input.get('actionGroupName', 'unknown')}" if action_group_input else "action_group"
                 
-                with self.langfuse.start_as_current_span(
+                with self.langfuse.start_as_current_observation(
                     name=action_name,
+                    as_type="tool",
                     input=action_group_input or {},
                     output="",
                     metadata={
                         "component": "action_group", 
                         "level": "L3",
                         "parent_component": "orchestration",
-                        "type": "tool",
-                        "langfuse_object_type": "tool"
+                        "tool_type": "action_group",
+                        "api_path": action_group_input.get("apiPath") if action_group_input else None,
+                        "execution_type": action_group_input.get("executionType") if action_group_input else None
                     }
                 ) as l3_tool:
                     
-                    # L4: Action result
+                    # Update L3 tool with basic output
                     if action_group_output:
                         l3_tool.update(output=action_group_output)
                         
-                    processed_objects.append("tool")
+                        # L4: Create child span for action result details (OpenTelemetry parity)
+                        with l3_tool.start_as_current_observation(
+                            name="action_result",
+                            as_type="span",
+                            input="Action group execution completed",
+                            output=action_group_output,
+                            metadata={
+                                "component": "action_result",
+                                "level": "L4",
+                                "parent_component": "action_group",
+                                "action_group_name": action_group_input.get("actionGroupName") if action_group_input else None,
+                                "api_path": action_group_input.get("apiPath") if action_group_input else None,
+                                "execution_result": action_group_output
+                            }
+                        ):
+                            processed_objects.append("span")  # L4 span
+                            counts["spans"] += 1
+                        
+                    processed_objects.append("tool")  # L3 tool
                     counts["tools"] += 1
             
             # L3: Handle knowledge base lookups (retrievers) - Check both invocationInput and observation
@@ -329,25 +372,45 @@ class LangfuseTraceRegistrar:
             kb_output = orch_trace.get("observation", {}).get("knowledgeBaseLookupOutput")
             
             if kb_input or kb_output:
-                with self.langfuse.start_as_current_span(
+                with self.langfuse.start_as_current_observation(
                     name="knowledgeBaseLookup",
+                    as_type="retriever",
                     input=kb_input.get("text", "") if kb_input else "",
                     output="",
                     metadata={
                         "component": "knowledge_base",
                         "level": "L3", 
                         "parent_component": "orchestration",
-                        "type": "retriever",
-                        "langfuse_object_type": "retriever"
+                        "knowledge_base_id": kb_input.get("knowledgeBaseId") if kb_input else None,
+                        "retrieval_type": "semantic_search"
                     }
                 ) as l3_retriever:
                     
-                    # L4: Knowledge base lookup output
+                    # Update L3 retriever with basic output
                     if kb_output:
                         results = kb_output.get("retrievedReferences", [])
                         l3_retriever.update(output={"retrieved_documents": len(results), "results": results})
                         
-                    processed_objects.append("retriever")
+                        # L4: Create child span for retrieval results details (OpenTelemetry parity)
+                        with l3_retriever.start_as_current_observation(
+                            name="knowledgeBaseLookupOutput",
+                            as_type="span",
+                            input="Knowledge base search completed",
+                            output={"retrieved_documents": len(results), "results": results},
+                            metadata={
+                                "component": "retrieval_results",
+                                "level": "L4",
+                                "parent_component": "knowledge_base",
+                                "knowledge_base_id": kb_input.get("knowledgeBaseId") if kb_input else None,
+                                "query": kb_input.get("text") if kb_input else None,
+                                "results_count": len(results),
+                                "retrieved_references": results
+                            }
+                        ):
+                            processed_objects.append("span")  # L4 span
+                            counts["spans"] += 1
+                        
+                    processed_objects.append("retriever")  # L3 retriever
                     counts["retrievers"] += 1
             
             # L3: Handle code interpreter
@@ -366,13 +429,48 @@ class LangfuseTraceRegistrar:
                         }
                     ) as l3_code:
                         
-                        # L4: Code interpreter result
+                        # Update L3 code interpreter with basic output
                         if "observation" in code_call:
                             output_data = code_call["observation"].get("codeInterpreterInvocationOutput", {})
                             l3_code.update(output=output_data)
                             
-                        processed_objects.append("tool")
+                            # L4: Create child span for code interpreter result details (OpenTelemetry parity)
+                            with l3_code.start_as_current_observation(
+                                name="code_interpreter_result",
+                                as_type="span",
+                                input="Code execution completed",
+                                output=output_data,
+                                metadata={
+                                    "component": "code_result",
+                                    "level": "L4",
+                                    "parent_component": "code_interpreter",
+                                    "execution_result": output_data,
+                                    "code_input": code_call.get("invocationInput", {}).get("code", "")
+                                }
+                            ):
+                                processed_objects.append("span")  # L4 span
+                                counts["spans"] += 1
+                            
+                        processed_objects.append("tool")  # L3 tool
                         counts["tools"] += 1
+            
+            # L3: Handle final response
+            final_response = orch_trace.get("observation", {}).get("finalResponse")
+            if final_response:
+                with self.langfuse.start_as_current_observation(
+                    name="finalResponse",
+                    as_type="span",
+                    input="Processing final response for user",
+                    output=final_response.get("text", ""),
+                    metadata={
+                        "component": "final_response",
+                        "level": "L3",
+                        "parent_component": "orchestration",
+                        "response_type": orch_trace.get("observation", {}).get("type", "FINISH")
+                    }
+                ):
+                    processed_objects.append("span")
+                    counts["spans"] += 1
         
         return {"objects": processed_objects, "counts": counts}
     
@@ -382,8 +480,9 @@ class LangfuseTraceRegistrar:
         counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
         
         # L2: Create preprocessing span
-        with self.langfuse.start_as_current_span(
+        with self.langfuse.start_as_current_observation(
             name="pre_processing",
+            as_type="span",
             input=prep_trace.get("modelInvocationInput", {}).get("text", ""),
             output="",
             metadata={
@@ -395,8 +494,9 @@ class LangfuseTraceRegistrar:
             
             # L3: Handle LLM invocation if present
             if "modelInvocationInput" in prep_trace or "modelInvocationOutput" in prep_trace:
-                with self.langfuse.start_as_current_generation(
+                with self.langfuse.start_as_current_observation(
                     name="llm",
+                    as_type="generation",
                     model=self._extract_model_id(prep_trace),
                     input=prep_trace.get("modelInvocationInput", {}).get("text", ""),
                     output="",
@@ -407,13 +507,39 @@ class LangfuseTraceRegistrar:
                     }
                 ) as l3_generation:
                     
+                    # L4: Preprocessing model output (OpenTelemetry parity)
                     if "modelInvocationOutput" in prep_trace:
                         model_output = prep_trace["modelInvocationOutput"]
                         output_text = self._extract_output_text(model_output)
-                        l3_generation.update(output=output_text)
+                        usage_data = self._extract_usage_data(model_output)
+                        
+                        # Update L3 generation
+                        l3_generation.update(
+                            output=output_text,
+                            usage_details=usage_data
+                        )
+                        
+                        # L4: Create child span for preprocessing model output details
+                        with l3_generation.start_as_current_observation(
+                            name="PreProcessingModelInvocationOutput",
+                            as_type="span",
+                            input="Preprocessing model inference completed",
+                            output=output_text,
+                            metadata={
+                                "component": "model_output",
+                                "level": "L4",
+                                "parent_component": "llm",
+                                "trace_type": "PRE_PROCESSING",
+                                "raw_response": model_output.get("parsedResponse", {}),
+                                "usage_details": usage_data
+                            }
+                        ):
+                            processed_objects.append("span")  # L4 span
+                            counts["spans"] += 1
+                        
                         l2_span.update(output=output_text)
                         
-                    processed_objects.append("generation")
+                    processed_objects.append("generation")  # L3 generation
                     counts["generations"] += 1
         
         return {"objects": processed_objects, "counts": counts}
@@ -424,8 +550,9 @@ class LangfuseTraceRegistrar:
         counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
         
         # L2: Create postprocessing span
-        with self.langfuse.start_as_current_span(
+        with self.langfuse.start_as_current_observation(
             name="postProcessingTrace", 
+            as_type="span",
             input=post_trace.get("modelInvocationInput", {}).get("text", ""),
             output="",
             metadata={
@@ -437,8 +564,9 @@ class LangfuseTraceRegistrar:
             
             # L3: Handle LLM invocation
             if "modelInvocationInput" in post_trace or "modelInvocationOutput" in post_trace:
-                with self.langfuse.start_as_current_generation(
+                with self.langfuse.start_as_current_observation(
                     name="llm",
+                    as_type="generation",
                     model=self._extract_model_id(post_trace),
                     input=post_trace.get("modelInvocationInput", {}).get("text", ""),
                     output="",
@@ -449,13 +577,39 @@ class LangfuseTraceRegistrar:
                     }
                 ) as l3_generation:
                     
+                    # L4: Postprocessing model output (OpenTelemetry parity)
                     if "modelInvocationOutput" in post_trace:
                         model_output = post_trace["modelInvocationOutput"]
                         output_text = self._extract_output_text(model_output)
-                        l3_generation.update(output=output_text)
+                        usage_data = self._extract_usage_data(model_output)
+                        
+                        # Update L3 generation
+                        l3_generation.update(
+                            output=output_text,
+                            usage_details=usage_data
+                        )
+                        
+                        # L4: Create child span for postprocessing model output details
+                        with l3_generation.start_as_current_observation(
+                            name="PostProcessingModelInvocationOutput",
+                            as_type="span",
+                            input="Postprocessing model inference completed",
+                            output=output_text,
+                            metadata={
+                                "component": "model_output",
+                                "level": "L4",
+                                "parent_component": "llm",
+                                "trace_type": "POST_PROCESSING",
+                                "raw_response": model_output.get("parsedResponse", {}),
+                                "usage_details": usage_data
+                            }
+                        ):
+                            processed_objects.append("span")  # L4 span
+                            counts["spans"] += 1
+                        
                         l2_span.update(output=output_text)
                         
-                    processed_objects.append("generation")
+                    processed_objects.append("generation")  # L3 generation
                     counts["generations"] += 1
         
         return {"objects": processed_objects, "counts": counts}
@@ -471,9 +625,10 @@ class LangfuseTraceRegistrar:
         # Determine guardrail type
         guardrail_name = "guardrail_pre" if "pre" in trace_id else "guardrail_post"
         
-        # L2: Create guardrail span
-        with self.langfuse.start_as_current_span(
+        # L2: Create guardrail span using native 2025 SDK guardrail type
+        with self.langfuse.start_as_current_observation(
             name=guardrail_name,
+            as_type="guardrail",
             input="",
             output=f"Action: {action}",
             metadata={
@@ -481,8 +636,9 @@ class LangfuseTraceRegistrar:
                 "level": "L2",
                 "guardrail_action": action,
                 "blocked": action in ["BLOCKED", "INTERVENED"],
-                "type": "guardrail",
-                "langfuse_object_type": "guardrail"
+                "guardrail_type": "bedrock_agent",
+                "input_assessments": guard_trace.get("inputAssessments", []),
+                "output_assessments": guard_trace.get("outputAssessments", [])
             }
         ):
             processed_objects.append("guardrail")
