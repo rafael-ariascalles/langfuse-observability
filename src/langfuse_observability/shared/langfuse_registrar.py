@@ -62,10 +62,7 @@ class LangfuseTraceRegistrar:
         try:
             logger.info(f"🔄 Processing traces for agent {request.agent_id}, session {request.session_id}")
             
-            # Create root agent trace
-            root_trace = self._create_root_agent_trace(request, trace_id)
-            
-            # Process each Bedrock trace and create Langfuse objects
+            # Process traces within a root span context using 2025 Langfuse SDK patterns
             processed_objects = []
             total_generations = 0
             total_tools = 0
@@ -74,49 +71,69 @@ class LangfuseTraceRegistrar:
             total_guardrails = 0
             total_events = 0
             
-            for i, bedrock_trace in enumerate(request.traces):
-                try:
-                    # Map Bedrock trace to Langfuse objects
-                    langfuse_objects = self.mapper.map_bedrock_trace(bedrock_trace)
-                    
-                    for obj in langfuse_objects:
-                        # Create the appropriate Langfuse object
-                        created_obj = self._create_langfuse_object(root_trace, obj, i)
-                        if created_obj:
-                            processed_objects.append(created_obj)
-                            
-                            # Count object types
-                            obj_type = obj.get("type", "unknown")
-                            if obj_type == "generation":
-                                total_generations += 1
-                            elif obj_type == "tool":
-                                total_tools += 1
-                            elif obj_type == "retriever":
-                                total_retrievers += 1
-                            elif obj_type == "span":
-                                total_spans += 1
-                            elif obj_type == "guardrail":
-                                total_guardrails += 1
-                            elif obj_type == "event":
-                                total_events += 1
-                
-                except Exception as e:
-                    logger.error(f"Error processing trace {i}: {str(e)}")
-                    # Create fallback event for failed trace
-                    self._create_fallback_event(root_trace, bedrock_trace, str(e), i)
-            
-            # Update root trace with processing summary
-            end_time = time.time()
-            processing_duration = (end_time - start_time) * 1000
-            
-            # Create a summary span to capture the processing results
-            root_trace.start_span(
-                name="trace_processing_summary",
-                input=f"Processed {len(request.traces)} Bedrock Agent traces",
-                output=f"Created {len(processed_objects)} structured Langfuse objects",
+            with self.langfuse.start_as_current_span(
+                name=f"bedrock_agent_{request.agent_id}",
+                input=request.input_text,
+                output=request.output_text,
                 metadata={
-                    "type": "event",
-                    "level": "INFO",
+                    "agent_id": request.agent_id,
+                    "session_id": request.session_id,
+                    "user_id": request.user_id,
+                    "tags": json.dumps(request.tags or []),
+                    "trace_type": "root_agent_trace",
+                    "project_name": self.project_name,
+                    "environment": self.environment
+                }
+            ) as root_span:
+                
+                for i, bedrock_trace in enumerate(request.traces):
+                    try:
+                        # Map Bedrock trace to Langfuse objects
+                        langfuse_objects = self.mapper.map_bedrock_trace(bedrock_trace)
+                        
+                        for obj in langfuse_objects:
+                            # Create the appropriate Langfuse object within the root context
+                            with self._create_langfuse_object_context(obj, i):
+                                processed_objects.append(obj)
+                                
+                                # Count object types
+                                obj_type = obj.get("type", "unknown")
+                                if obj_type == "generation":
+                                    total_generations += 1
+                                elif obj_type == "tool":
+                                    total_tools += 1
+                                elif obj_type == "retriever":
+                                    total_retrievers += 1
+                                elif obj_type == "span":
+                                    total_spans += 1
+                                elif obj_type == "guardrail":
+                                    total_guardrails += 1
+                                elif obj_type == "event":
+                                    total_events += 1
+                    
+                    except Exception as e:
+                        logger.error(f"Error processing trace {i}: {str(e)}")
+                        # Create fallback event for failed trace within context
+                        with self.langfuse.start_as_current_span(
+                            name=f"processing_error_{i}",
+                            input=f"Failed to process Bedrock trace: {str(e)}",
+                            output=str(bedrock_trace),
+                            metadata={
+                                "type": "event",
+                                "level": "ERROR",
+                                "component": "trace_processor",
+                                "error_message": str(e),
+                                "trace_index": i
+                            }
+                        ):
+                            pass
+                
+                # Update root span with processing summary
+                end_time = time.time()
+                processing_duration = (end_time - start_time) * 1000
+                
+                # Update the root span with processing summary - store additional metadata
+                processing_metadata = {
                     "processing_duration_ms": processing_duration,
                     "processed_objects": {
                         "generations": total_generations,
@@ -126,13 +143,16 @@ class LangfuseTraceRegistrar:
                         "guardrails": total_guardrails,
                         "events": total_events,
                         "total": len(processed_objects)
-                    },
-                    "langfuse_object_type": "event"
+                    }
                 }
-            ).end()
+                
+                # Update root span output to include summary
+                root_span.update(
+                    output=f"Successfully processed {len(processed_objects)} structured Langfuse objects from {len(request.traces)} Bedrock traces",
+                    metadata=processing_metadata
+                )
             
-            # End the root trace and flush to ensure data is sent to Langfuse
-            root_trace.end()
+            # Flush to ensure data is sent to Langfuse
             self.langfuse.flush()
             
             logger.info(f"✅ Successfully registered {len(processed_objects)} Langfuse objects "
@@ -172,8 +192,8 @@ class LangfuseTraceRegistrar:
             "trace_created_at": datetime.now(timezone.utc).isoformat()
         })
         
-        # Create root trace using correct Langfuse SDK syntax
-        root_trace = self.langfuse.start_span(
+        # Create root trace using correct 2025 Langfuse SDK - use start_as_current_span for proper context
+        root_trace = self.langfuse.start_as_current_span(
             name=f"bedrock_agent_{request.agent_id}",
             input=request.input_text,
             output=request.output_text,
@@ -188,6 +208,66 @@ class LangfuseTraceRegistrar:
         
         logger.debug(f"Created root trace: {trace_id}")
         return root_trace
+    
+    def _create_langfuse_object_context(self, obj_data: Dict[str, Any], trace_index: int):
+        """Create the appropriate Langfuse object context manager based on type."""
+        
+        obj_type = obj_data.get("type")
+        obj_name = obj_data.get("name", f"bedrock_{obj_type}_{trace_index}")
+        
+        if obj_type == "generation":
+            return self._create_generation_context(obj_data, obj_name)
+        elif obj_type in ["tool", "retriever", "span", "guardrail", "event"]:
+            return self._create_span_context(obj_data, obj_name, obj_type)
+        else:
+            logger.warning(f"Unknown object type: {obj_type}")
+            return self._create_span_context(obj_data, f"unknown_{obj_name}", "event")
+    
+    def _create_generation_context(self, obj_data: Dict[str, Any], name: str):
+        """Create generation context manager."""
+        
+        # Build generation parameters
+        generation_params = {
+            "name": name,
+            "input": obj_data.get("input"),
+            "output": obj_data.get("output"),
+            "model": obj_data.get("model", "bedrock-agent-model"),
+            "metadata": obj_data.get("metadata", {})
+        }
+        
+        # Create generation context
+        generation_context = self.langfuse.start_as_current_generation(**generation_params)
+        
+        # Add usage if available (needs to be done after creation)
+        usage_data = obj_data.get("usage")
+        if usage_data:
+            # Usage will be updated within the context
+            pass
+            
+        logger.debug(f"Created generation context: {name}")
+        return generation_context
+    
+    def _create_span_context(self, obj_data: Dict[str, Any], name: str, span_type: str):
+        """Create span context manager."""
+        
+        metadata = {
+            **obj_data.get("metadata", {}),
+            "type": span_type,
+            "langfuse_object_type": span_type
+        }
+        
+        if span_type == "event":
+            metadata["level"] = obj_data.get("level", "DEFAULT")
+            
+        span_context = self.langfuse.start_as_current_span(
+            name=name,
+            input=obj_data.get("input"),
+            output=obj_data.get("output"),
+            metadata=metadata
+        )
+        
+        logger.debug(f"Created {span_type} span context: {name}")
+        return span_context
     
     def _create_langfuse_object(self, parent_trace, obj_data: Dict[str, Any], trace_index: int):
         """Create the appropriate Langfuse object based on type."""
@@ -237,8 +317,8 @@ class LangfuseTraceRegistrar:
                 "total": usage_data.get("total", 0)
             }
         
-        # Create generation using correct Langfuse SDK syntax
-        generation = self.langfuse.start_generation(
+        # Create generation using correct 2025 Langfuse SDK syntax
+        generation = self.langfuse.start_as_current_generation(
             name=generation_params["name"],
             input=generation_params["input"],
             output=generation_params["output"],
@@ -258,8 +338,8 @@ class LangfuseTraceRegistrar:
     def _create_tool(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse tool object for external calls."""
         
-        # Tools are spans with tool-specific metadata
-        tool = parent_trace.start_span(
+        # Tools are spans with tool-specific metadata - use current context
+        tool = self.langfuse.start_as_current_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -276,8 +356,8 @@ class LangfuseTraceRegistrar:
     def _create_retriever(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse retriever object for data retrieval."""
         
-        # Retrievers are spans with retriever-specific metadata
-        retriever = parent_trace.start_span(
+        # Retrievers are spans with retriever-specific metadata - use current context
+        retriever = self.langfuse.start_as_current_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -294,7 +374,7 @@ class LangfuseTraceRegistrar:
     def _create_span(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse span object for durations."""
         
-        span = parent_trace.start_span(
+        span = self.langfuse.start_as_current_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -307,8 +387,8 @@ class LangfuseTraceRegistrar:
     def _create_guardrail(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse guardrail object for content protection."""
         
-        # Guardrails are spans with guardrail-specific metadata
-        guardrail = parent_trace.start_span(
+        # Guardrails are spans with guardrail-specific metadata - use current context
+        guardrail = self.langfuse.start_as_current_span(
             name=name,
             input=obj_data.get("input"),
             output=obj_data.get("output"),
@@ -325,8 +405,8 @@ class LangfuseTraceRegistrar:
     def _create_event(self, parent_trace, obj_data: Dict[str, Any], name: str):
         """Create Langfuse event object for discrete events."""
         
-        # Events are created as child spans with event-specific metadata
-        event = parent_trace.start_span(
+        # Events are created as child spans with event-specific metadata - use current context
+        event = self.langfuse.start_as_current_span(
             name=name,
             input=obj_data.get("input", ""),
             output=obj_data.get("output", ""),
@@ -344,7 +424,7 @@ class LangfuseTraceRegistrar:
     def _create_fallback_event(self, parent_trace, bedrock_trace: Dict[str, Any], error_msg: str, trace_index: int):
         """Create fallback event when trace processing fails."""
         
-        fallback_event = parent_trace.start_span(
+        fallback_event = self.langfuse.start_as_current_span(
             name=f"processing_error_{trace_index}",
             input=f"Failed to process Bedrock trace: {error_msg}",
             output=str(bedrock_trace),
