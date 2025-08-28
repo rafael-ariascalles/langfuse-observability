@@ -62,7 +62,7 @@ class LangfuseTraceRegistrar:
         try:
             logger.info(f"🔄 Processing traces for agent {request.agent_id}, session {request.session_id}")
             
-            # Process traces within a root span context using 2025 Langfuse SDK patterns
+            # Process traces with hierarchical structure like OpenTelemetry implementation
             processed_objects = []
             total_generations = 0
             total_tools = 0
@@ -71,8 +71,9 @@ class LangfuseTraceRegistrar:
             total_guardrails = 0
             total_events = 0
             
+            # Create L1 root span for the entire agent session
             with self.langfuse.start_as_current_span(
-                name=f"bedrock_agent_{request.agent_id}",
+                name=f"Bedrock Agent: {request.agent_id}",
                 input=request.input_text,
                 output=request.output_text,
                 metadata={
@@ -88,32 +89,20 @@ class LangfuseTraceRegistrar:
                 
                 for i, bedrock_trace in enumerate(request.traces):
                     try:
-                        # Map Bedrock trace to Langfuse objects
-                        langfuse_objects = self.mapper.map_bedrock_trace(bedrock_trace)
-                        
-                        for obj in langfuse_objects:
-                            # Create the appropriate Langfuse object within the root context
-                            with self._create_langfuse_object_context(obj, i):
-                                processed_objects.append(obj)
-                                
-                                # Count object types
-                                obj_type = obj.get("type", "unknown")
-                                if obj_type == "generation":
-                                    total_generations += 1
-                                elif obj_type == "tool":
-                                    total_tools += 1
-                                elif obj_type == "retriever":
-                                    total_retrievers += 1
-                                elif obj_type == "span":
-                                    total_spans += 1
-                                elif obj_type == "guardrail":
-                                    total_guardrails += 1
-                                elif obj_type == "event":
-                                    total_events += 1
+                        # Process each trace with hierarchical structure based on trace type
+                        result = self._process_trace_hierarchically(bedrock_trace, root_span, i)
+                        if result:
+                            processed_objects.extend(result["objects"])
+                            total_generations += result.get("generations", 0)
+                            total_tools += result.get("tools", 0)
+                            total_retrievers += result.get("retrievers", 0)
+                            total_spans += result.get("spans", 0)
+                            total_guardrails += result.get("guardrails", 0)
+                            total_events += result.get("events", 0)
                     
                     except Exception as e:
                         logger.error(f"Error processing trace {i}: {str(e)}")
-                        # Create fallback event for failed trace within context
+                        # Create fallback event for failed trace
                         with self.langfuse.start_as_current_span(
                             name=f"processing_error_{i}",
                             input=f"Failed to process Bedrock trace: {str(e)}",
@@ -132,24 +121,20 @@ class LangfuseTraceRegistrar:
                 end_time = time.time()
                 processing_duration = (end_time - start_time) * 1000
                 
-                # Update the root span with processing summary - store additional metadata
-                processing_metadata = {
-                    "processing_duration_ms": processing_duration,
-                    "processed_objects": {
-                        "generations": total_generations,
-                        "tools": total_tools,
-                        "retrievers": total_retrievers,
-                        "spans": total_spans,
-                        "guardrails": total_guardrails,
-                        "events": total_events,
-                        "total": len(processed_objects)
-                    }
-                }
-                
-                # Update root span output to include summary
                 root_span.update(
                     output=f"Successfully processed {len(processed_objects)} structured Langfuse objects from {len(request.traces)} Bedrock traces",
-                    metadata=processing_metadata
+                    metadata={
+                        "processing_duration_ms": processing_duration,
+                        "processed_objects": {
+                            "generations": total_generations,
+                            "tools": total_tools,
+                            "retrievers": total_retrievers,
+                            "spans": total_spans,
+                            "guardrails": total_guardrails,
+                            "events": total_events,
+                            "total": len(processed_objects)
+                        }
+                    }
                 )
             
             # Flush to ensure data is sent to Langfuse
@@ -208,6 +193,364 @@ class LangfuseTraceRegistrar:
         
         logger.debug(f"Created root trace: {trace_id}")
         return root_trace
+    
+    def _process_trace_hierarchically(self, bedrock_trace: Dict[str, Any], root_span, trace_index: int) -> Dict[str, Any]:
+        """
+        Process Bedrock trace with hierarchical structure like OpenTelemetry implementation.
+        
+        Hierarchy:
+        L1: Root span "Bedrock Agent: [agent_id]"
+          L2: Major components (orchestrationTrace, preProcessingTrace, postProcessingTrace, guardrailTrace)  
+            L3: Sub-operations (generation/llm, rationale, action_group, knowledgeBaseLookup)
+              L4: Specific results (model output, action result, retrieval results)
+        """
+        trace_content = bedrock_trace.get("trace", {})
+        processed_objects = []
+        counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
+        
+        # Handle different trace types with proper hierarchy
+        if "orchestrationTrace" in trace_content:
+            result = self._process_orchestration_trace_hierarchically(trace_content["orchestrationTrace"], root_span)
+            processed_objects.extend(result["objects"])
+            self._update_counts(counts, result["counts"])
+            
+        elif "preProcessingTrace" in trace_content:
+            result = self._process_preprocessing_trace_hierarchically(trace_content["preProcessingTrace"], root_span)
+            processed_objects.extend(result["objects"])
+            self._update_counts(counts, result["counts"])
+            
+        elif "postProcessingTrace" in trace_content:
+            result = self._process_postprocessing_trace_hierarchically(trace_content["postProcessingTrace"], root_span)
+            processed_objects.extend(result["objects"])
+            self._update_counts(counts, result["counts"])
+            
+        elif "guardrailTrace" in trace_content:
+            result = self._process_guardrail_trace_hierarchically(trace_content["guardrailTrace"], root_span)
+            processed_objects.extend(result["objects"])
+            self._update_counts(counts, result["counts"])
+            
+        elif "failureTrace" in trace_content:
+            result = self._process_failure_trace_hierarchically(trace_content["failureTrace"], root_span)
+            processed_objects.extend(result["objects"])
+            self._update_counts(counts, result["counts"])
+        
+        return {"objects": processed_objects, **counts}
+    
+    def _process_orchestration_trace_hierarchically(self, orch_trace: Dict[str, Any], root_span) -> Dict[str, Any]:
+        """Process orchestration trace with L2->L3->L4 hierarchy"""
+        processed_objects = []
+        counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
+        
+        # L2: Create orchestrationTrace span
+        with self.langfuse.start_as_current_span(
+            name="orchestrationTrace",
+            input=orch_trace.get("modelInvocationInput", {}).get("text", ""),
+            output="",  # Will be updated when we get the output
+            metadata={
+                "component": "orchestration",
+                "trace_type": "ORCHESTRATION",
+                "level": "L2"
+            }
+        ) as l2_span:
+            
+            # L3: Handle LLM invocation (generation)
+            if "modelInvocationInput" in orch_trace or "modelInvocationOutput" in orch_trace:
+                with self.langfuse.start_as_current_generation(
+                    name="llm",
+                    model=self._extract_model_id(orch_trace),
+                    input=orch_trace.get("modelInvocationInput", {}).get("text", ""),
+                    output="",  # Will be updated
+                    metadata={
+                        "component": "llm",
+                        "level": "L3",
+                        "parent_component": "orchestration"
+                    }
+                ) as l3_generation:
+                    
+                    # L4: Model invocation output
+                    if "modelInvocationOutput" in orch_trace:
+                        model_output = orch_trace["modelInvocationOutput"]
+                        output_text = self._extract_output_text(model_output)
+                        usage_data = self._extract_usage_data(model_output)
+                        
+                        l3_generation.update(
+                            output=output_text,
+                            usage_details=usage_data
+                        )
+                        l2_span.update(output=output_text)  # Update L2 span output too
+                        
+                    processed_objects.append("generation")
+                    counts["generations"] += 1
+            
+            # L3: Handle rationale
+            if "rationale" in orch_trace:
+                with self.langfuse.start_as_current_span(
+                    name="rationale",
+                    input=orch_trace["rationale"].get("text", ""),
+                    output="Agent reasoning completed",
+                    metadata={
+                        "component": "rationale",
+                        "level": "L3",
+                        "parent_component": "orchestration"
+                    }
+                ):
+                    processed_objects.append("span")
+                    counts["spans"] += 1
+            
+            # L3: Handle action groups (tools) - Check both invocationInput and observation
+            action_group_input = orch_trace.get("invocationInput", {}).get("actionGroupInvocationInput")
+            action_group_output = orch_trace.get("observation", {}).get("actionGroupInvocationOutput")
+            
+            if action_group_input or action_group_output:
+                action_name = f"{action_group_input.get('actionGroupName', 'unknown')}" if action_group_input else "action_group"
+                
+                with self.langfuse.start_as_current_span(
+                    name=action_name,
+                    input=action_group_input or {},
+                    output="",
+                    metadata={
+                        "component": "action_group", 
+                        "level": "L3",
+                        "parent_component": "orchestration",
+                        "type": "tool",
+                        "langfuse_object_type": "tool"
+                    }
+                ) as l3_tool:
+                    
+                    # L4: Action result
+                    if action_group_output:
+                        l3_tool.update(output=action_group_output)
+                        
+                    processed_objects.append("tool")
+                    counts["tools"] += 1
+            
+            # L3: Handle knowledge base lookups (retrievers) - Check both invocationInput and observation
+            kb_input = orch_trace.get("invocationInput", {}).get("knowledgeBaseLookupInput")
+            kb_output = orch_trace.get("observation", {}).get("knowledgeBaseLookupOutput")
+            
+            if kb_input or kb_output:
+                with self.langfuse.start_as_current_span(
+                    name="knowledgeBaseLookup",
+                    input=kb_input.get("text", "") if kb_input else "",
+                    output="",
+                    metadata={
+                        "component": "knowledge_base",
+                        "level": "L3", 
+                        "parent_component": "orchestration",
+                        "type": "retriever",
+                        "langfuse_object_type": "retriever"
+                    }
+                ) as l3_retriever:
+                    
+                    # L4: Knowledge base lookup output
+                    if kb_output:
+                        results = kb_output.get("retrievedReferences", [])
+                        l3_retriever.update(output={"retrieved_documents": len(results), "results": results})
+                        
+                    processed_objects.append("retriever")
+                    counts["retrievers"] += 1
+            
+            # L3: Handle code interpreter
+            if "codeInterpreterInvocations" in orch_trace:
+                for code_call in orch_trace["codeInterpreterInvocations"]:
+                    with self.langfuse.start_as_current_span(
+                        name="CodeInterpreter",
+                        input=code_call.get("invocationInput", {}).get("code", ""),
+                        output="",
+                        metadata={
+                            "component": "code_interpreter",
+                            "level": "L3",
+                            "parent_component": "orchestration", 
+                            "type": "tool",
+                            "langfuse_object_type": "tool"
+                        }
+                    ) as l3_code:
+                        
+                        # L4: Code interpreter result
+                        if "observation" in code_call:
+                            output_data = code_call["observation"].get("codeInterpreterInvocationOutput", {})
+                            l3_code.update(output=output_data)
+                            
+                        processed_objects.append("tool")
+                        counts["tools"] += 1
+        
+        return {"objects": processed_objects, "counts": counts}
+    
+    def _process_preprocessing_trace_hierarchically(self, prep_trace: Dict[str, Any], root_span) -> Dict[str, Any]:
+        """Process preprocessing trace with L2->L3->L4 hierarchy"""
+        processed_objects = []
+        counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
+        
+        # L2: Create preprocessing span
+        with self.langfuse.start_as_current_span(
+            name="pre_processing",
+            input=prep_trace.get("modelInvocationInput", {}).get("text", ""),
+            output="",
+            metadata={
+                "component": "preprocessing",
+                "trace_type": "PRE_PROCESSING", 
+                "level": "L2"
+            }
+        ) as l2_span:
+            
+            # L3: Handle LLM invocation if present
+            if "modelInvocationInput" in prep_trace or "modelInvocationOutput" in prep_trace:
+                with self.langfuse.start_as_current_generation(
+                    name="llm",
+                    model=self._extract_model_id(prep_trace),
+                    input=prep_trace.get("modelInvocationInput", {}).get("text", ""),
+                    output="",
+                    metadata={
+                        "component": "llm",
+                        "level": "L3",
+                        "parent_component": "preprocessing"
+                    }
+                ) as l3_generation:
+                    
+                    if "modelInvocationOutput" in prep_trace:
+                        model_output = prep_trace["modelInvocationOutput"]
+                        output_text = self._extract_output_text(model_output)
+                        l3_generation.update(output=output_text)
+                        l2_span.update(output=output_text)
+                        
+                    processed_objects.append("generation")
+                    counts["generations"] += 1
+        
+        return {"objects": processed_objects, "counts": counts}
+    
+    def _process_postprocessing_trace_hierarchically(self, post_trace: Dict[str, Any], root_span) -> Dict[str, Any]:
+        """Process postprocessing trace with L2->L3->L4 hierarchy"""
+        processed_objects = []
+        counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
+        
+        # L2: Create postprocessing span
+        with self.langfuse.start_as_current_span(
+            name="postProcessingTrace", 
+            input=post_trace.get("modelInvocationInput", {}).get("text", ""),
+            output="",
+            metadata={
+                "component": "postprocessing",
+                "trace_type": "POST_PROCESSING",
+                "level": "L2"
+            }
+        ) as l2_span:
+            
+            # L3: Handle LLM invocation
+            if "modelInvocationInput" in post_trace or "modelInvocationOutput" in post_trace:
+                with self.langfuse.start_as_current_generation(
+                    name="llm",
+                    model=self._extract_model_id(post_trace),
+                    input=post_trace.get("modelInvocationInput", {}).get("text", ""),
+                    output="",
+                    metadata={
+                        "component": "llm",
+                        "level": "L3", 
+                        "parent_component": "postprocessing"
+                    }
+                ) as l3_generation:
+                    
+                    if "modelInvocationOutput" in post_trace:
+                        model_output = post_trace["modelInvocationOutput"]
+                        output_text = self._extract_output_text(model_output)
+                        l3_generation.update(output=output_text)
+                        l2_span.update(output=output_text)
+                        
+                    processed_objects.append("generation")
+                    counts["generations"] += 1
+        
+        return {"objects": processed_objects, "counts": counts}
+    
+    def _process_guardrail_trace_hierarchically(self, guard_trace: Dict[str, Any], root_span) -> Dict[str, Any]:
+        """Process guardrail trace with L2 hierarchy"""
+        processed_objects = []
+        counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
+        
+        action = guard_trace.get("action", "NONE")
+        trace_id = guard_trace.get("traceId", "")
+        
+        # Determine guardrail type
+        guardrail_name = "guardrail_pre" if "pre" in trace_id else "guardrail_post"
+        
+        # L2: Create guardrail span
+        with self.langfuse.start_as_current_span(
+            name=guardrail_name,
+            input="",
+            output=f"Action: {action}",
+            metadata={
+                "component": "guardrail",
+                "level": "L2",
+                "guardrail_action": action,
+                "blocked": action in ["BLOCKED", "INTERVENED"],
+                "type": "guardrail",
+                "langfuse_object_type": "guardrail"
+            }
+        ):
+            processed_objects.append("guardrail")
+            counts["guardrails"] += 1
+        
+        return {"objects": processed_objects, "counts": counts}
+    
+    def _process_failure_trace_hierarchically(self, failure_trace: Dict[str, Any], root_span) -> Dict[str, Any]:
+        """Process failure trace with L2 hierarchy"""
+        processed_objects = []
+        counts = {"generations": 0, "tools": 0, "retrievers": 0, "spans": 0, "guardrails": 0, "events": 0}
+        
+        failure_reason = failure_trace.get("failureReason", "Unknown failure")
+        
+        # L2: Create failure event span
+        with self.langfuse.start_as_current_span(
+            name="agent_failure",
+            input="",
+            output=failure_reason,
+            metadata={
+                "component": "failure",
+                "level": "L2",
+                "failure_reason": failure_reason,
+                "type": "event",
+                "level": "ERROR",
+                "langfuse_object_type": "event"
+            }
+        ):
+            processed_objects.append("event")
+            counts["events"] += 1
+        
+        return {"objects": processed_objects, "counts": counts}
+    
+    def _extract_model_id(self, trace_data: Dict[str, Any]) -> str:
+        """Extract model ID from trace data"""
+        if "modelInvocationOutput" in trace_data:
+            raw_response = trace_data["modelInvocationOutput"].get("rawResponse", {})
+            if isinstance(raw_response, dict):
+                return raw_response.get("modelId", "bedrock-agent-model")
+        return "bedrock-agent-model"
+    
+    def _extract_output_text(self, model_output: Dict[str, Any]) -> str:
+        """Extract output text from model invocation output"""
+        raw_response = model_output.get("rawResponse", {})
+        if isinstance(raw_response, dict) and "content" in raw_response:
+            content = raw_response["content"]
+            if isinstance(content, list) and len(content) > 0:
+                return str(content[0].get("text", ""))
+            elif isinstance(content, str):
+                return content
+        return ""
+    
+    def _extract_usage_data(self, model_output: Dict[str, Any]) -> Dict[str, int]:
+        """Extract usage data from model invocation output"""
+        raw_response = model_output.get("rawResponse", {})
+        if isinstance(raw_response, dict) and "usage" in raw_response:
+            usage = raw_response["usage"]
+            return {
+                "input": usage.get("inputTokens", 0),
+                "output": usage.get("outputTokens", 0),
+                "total": usage.get("inputTokens", 0) + usage.get("outputTokens", 0)
+            }
+        return {}
+    
+    def _update_counts(self, target_counts: Dict[str, int], source_counts: Dict[str, int]):
+        """Update target counts with source counts"""
+        for key, value in source_counts.items():
+            target_counts[key] = target_counts.get(key, 0) + value
     
     def _create_langfuse_object_context(self, obj_data: Dict[str, Any], trace_index: int):
         """Create the appropriate Langfuse object context manager based on type."""
